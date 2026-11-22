@@ -132,7 +132,7 @@ dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
     // Minecraft ships Gson at runtime, but the plain test JVM needs it on the classpath.
-    testImplementation 'com.google.code.gson:gson:2.10.1'
+    testImplementation 'com.google.code.gson:gson:2.15.0'
 
     // Example optional mod dependency with JEI
     // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
