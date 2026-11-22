@@ -1,25 +1,449 @@
+# UnderMine Auth Mod
 
-Installation information
-=======
+Мод авторизации для **NeoForge 1.21.1 (21.1.265)**. Работает на клиенте и на сервере:
+проверяет bearer-токен от API UnderMine, пускает авторизованных игроков в мир, а
+неавторизованных держит в ограниченном режиме (limbo) до входа или регистрации.
 
-This template repository can be directly cloned to get you started with a new
-mod. Simply create a new repository cloned from this one, by following the
-instructions provided by [GitHub](https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-repository-from-a-template).
+- API по умолчанию: `https://staging.undermine.click`
+- API-репозиторий модом не изменяется — используются только публичные эндпоинты
+  `/api/v1.0/login`, `/api/v1.0/register`, `/api/v1.0/validate-token`.
+- Интеграция с лаунчером UnderMine: токен, адрес API и device id передаются в игру.
 
-Once you have your clone, simply open the repository in the IDE of your choice. The usual recommendation for an IDE is either IntelliJ IDEA or Eclipse.
+---
 
-If at any point you are missing libraries in your IDE, or you've run into problems you can
-run `gradlew --refresh-dependencies` to refresh the local cache. `gradlew clean` to reset everything 
-{this does not affect your code} and then start the process again.
+## Содержание
 
-Mapping Names:
-============
-By default, the MDK is configured to use the official mapping names from Mojang for methods and fields 
-in the Minecraft codebase. These names are covered by a specific license. All modders should be aware of this
-license. For the latest license text, refer to the mapping file itself, or the reference copy here:
-https://github.com/NeoForged/NeoForm/blob/main/Mojang.md
+1. [Возможности](#возможности)
+2. [Как проходит авторизация](#как-проходит-авторизация)
+3. [Команды `/log` и `/reg`](#команды-log-и-reg)
+4. [Экран аккаунта в игре](#экран-аккаунта-в-игре)
+5. [Режим limbo](#режим-limbo)
+6. [Таймер авторизации](#таймер-авторизации)
+7. [Конфиги](#конфиги)
+8. [Интеграция с лаунчером](#интеграция-с-лаунчером)
+9. [Файлы и данные](#файлы-и-данные)
+10. [Сборка и тесты](#сборка-и-тесты)
+11. [Безопасность](#безопасность)
+12. [Ограничения и устранение неполадок](#ограничения-и-устранение-неполадок)
+13. [Устройство проекта](#устройство-проекта)
 
-Additional Resources: 
-==========
-Community Documentation: https://docs.neoforged.net/  
-NeoForged Discord: https://discord.neoforged.net/
+---
+
+## Возможности
+
+- **Проверка токена до входа в мир** — в configuration-фазе, до спавна игрока.
+- **Шифрованная передача токена** между клиентом и сервером: одноразовый ECDH X25519,
+  HKDF-SHA256 и AES-256-GCM. Токен не идёт открытым текстом.
+- **Проверка через API**: подпись, издатель, срок действия, бан, роль и `token_version`
+  (смена пароля инвалидирует старые сессии).
+- **Привязка токена к игроку**: ник из JWT должен совпадать с ником в игре.
+- **Вход и регистрация без лаунчера** — команды `/log`, `/reg` и графический экран
+  «Аккаунт UnderMine» на титульном экране и в меню паузы.
+- **Пароль не попадает на игровой сервер**: команды и экран обращаются к API напрямую
+  с клиента по HTTPS, а серверу отправляется только готовый токен (в зашифрованном виде).
+- **Limbo для неавторизованных**: заморозка, слепота, защита инвентаря, блокировка
+  чата/команд/урона и напоминания.
+- **Таймер авторизации** с обратным отсчётом и отключением по истечении.
+- **Адаптивная подсказка** `/log` или `/reg` в зависимости от того, известен ли аккаунт.
+- **Настраиваемый адрес API** в конфигах клиента/сервера и через переменную окружения.
+- Локализация `en_us` / `ru_ru`; экран конфигурации в меню модов.
+
+---
+
+## Как проходит авторизация
+
+1. Лаунчер логинится в API и получает JWT (живёт 30 дней).
+2. Лаунчер передаёт токен в игру: через `${accessToken}` и переменную
+   `UNDERMINE_AUTH_TOKEN`.
+3. Мод ищет токен по порядку:
+   1. системное свойство `authmod.token` (только разработка);
+   2. переменная `UNDERMINE_AUTH_TOKEN`;
+   3. аргументы игры `--accessToken`, `--authSession` (подстановка лаунчера);
+   4. сохранённая сессия в `config/authmod-session.json` (после `/log` или экрана аккаунта);
+   5. ванильная сессия Minecraft.
+4. При подключении, в **configuration-фазе**, сервер отправляет одноразовый публичный
+   ключ X25519 и nonce. Клиент шифрует токен и отвечает зашифрованным payload'ом.
+5. Сервер расшифровывает токен, проверяет `exp`, привязку к игроку и валидирует токен
+   через API.
+6. Если токен валиден — игрок входит в мир. Если нет — либо отключается
+   (`allowUnauthenticatedJoin = false`), либо попадает в limbo и авторизуется командами.
+7. После `/log`/`/reg` клиент отправляет полученный токен по тому же шифрованному
+   сессионному каналу; сервер проверяет его и снимает ограничения.
+
+Валидные токены кэшируются на сервере на `validationCacheSeconds` (по умолчанию 300 с),
+чтобы не обращаться к API на каждый вход.
+
+---
+
+## Команды `/log` и `/reg`
+
+Обе команды — **клиентские**: они перехватываются до отправки на сервер, поэтому пароль
+уходит только в API по HTTPS и не попадает в логи игрового сервера.
+
+```text
+/log <пароль>
+/reg <пароль> <подтверждение пароля>
+```
+
+- `/log` принимает **весь остаток строки** как пароль: можно использовать `!`, `@`, `$`,
+  пробелы и другие символы.
+- `/reg` принимает два токена без пробелов; спецсимволы разрешены. Если пароль содержит
+  пробелы, используйте экран аккаунта.
+- Логин всегда равен нику игрока в игре (`GameProfile`), потому что сервер привязывает
+  токен к нику.
+- Пароль при регистрации: **8–72 байта** (как в API).
+- После успеха токен сохраняется в `config/authmod-session.json` и отправляется текущему
+  серверу (если он поддерживает мод и `sendTokenToServers = true`).
+- Если сервер не поддерживает мод, токен всё равно сохраняется и будет использован при
+  следующем входе на сервер с модом.
+- Повторные попытки ограничены: клиентская пауза 1.5 с, серверная
+  `authAttemptCooldownSeconds` (по умолчанию 3 с).
+
+### Подсказка `/log` или `/reg`
+
+API намеренно не сообщает, существует ли аккаунт (защита от перебора), поэтому мод
+использует безопасные подсказки:
+
+- клиент запоминает успешно использованные аккаунты в `config/authmod-accounts.json`
+  и при входе сообщает серверу, известен ли аккаунт;
+- **аккаунт известен** → напоминания говорят только про `/log`;
+- **аккаунт неизвестен** → напоминания предлагают `/reg` и дополнительно подсказывают
+  «уже есть аккаунт? `/log`»;
+- если `/reg` вернул `USERNAME_TAKEN` → сообщение «аккаунт уже существует, используйте
+  `/log`», и подсказка сразу переключается на `/log`;
+- если `/log` вернул 401 → сообщение предлагает `/reg`, если аккаунта ещё нет.
+
+На новом устройстве с существующим аккаунтом первая подсказка будет про `/reg`
+(API не позволяет проверить существование), но `/log` указан рядом.
+
+---
+
+## Экран аккаунта в игре
+
+Кнопка **«Аккаунт UnderMine»** добавляется на титульный экран и в меню паузы.
+
+Экран позволяет:
+
+- войти по логину и паролю;
+- зарегистрироваться (с автоматическим входом);
+- выйти из аккаунта (удаляет сохранённую сессию);
+- увидеть текущий адрес API и статус.
+
+Вход на экране также отправляет токен текущему серверу, если он поддерживает authmod.
+Если игра запущена лаунчером, токен лаунчера имеет приоритет над внутриигровой сессией:
+ник и UUID уже привязаны к аккаунту лаунчера.
+
+---
+
+## Режим limbo
+
+Игрок без валидного токена заходит на сервер (если `allowUnauthenticatedJoin = true`)
+и находится в ограниченном режиме:
+
+- **движение** — заморожен на точке входа (позиция возвращается каждый тик);
+- **слепота** — эффект blindness постоянно обновляется;
+- **инвентарь**:
+  - нельзя выбрасывать предметы (выброшенный предмет возвращается в инвентарь);
+  - нельзя подбирать предметы;
+  - нельзя использовать предметы, атаковать, ломать/ставить блоки, открывать контейнеры;
+- **чат и команды** — сообщения в чат и серверные команды блокируются;
+- **урон** — не получает урон (нельзя убить в limbo);
+- **напоминания** — в чат и над хотбаром раз в `reminderSeconds` секунд;
+- **таймер** — обратный отсчёт до отключения (см. ниже).
+
+Клиентские команды `/log` и `/reg` работают даже при заблокированном чате, потому что
+обрабатываются локально.
+
+На встроенном сервере (singleplayer/LAN-хост) ограничения по умолчанию **не применяются**
+(`enforceOnIntegratedServer = false`), чтобы не ломать одиночную игру. На выделенном
+сервере limbo включён по умолчанию.
+
+---
+
+## Таймер авторизации
+
+```toml
+# config/authmod-server.toml
+authTimeoutSeconds = 120   # 0 — таймер выключен
+```
+
+- Таймер стартует при входе игрока в limbo.
+- Каждую секунду в action bar показывается остаток:
+  `Осталось: 42 с • Регистрация: /reg <пароль> <пароль>` (или `/log`, если аккаунт известен).
+- Напоминания в чате также содержат остаток времени: `... Осталось: 42 с.`
+- За 10 секунд текст становится красным.
+- По истечении игрок отключается с сообщением:
+  `UnderMine: вы не авторизовались за 120 с. Переподключитесь и введите /log ...`.
+- При успешном `/log` или `/reg` таймер снимается.
+- Диапазон: `0–3600`; `0` полностью отключает таймер и отсчёт.
+
+---
+
+## Конфиги
+
+Файлы создаются автоматически:
+
+- клиент: `config/authmod-client.toml`
+- сервер: `config/authmod-server.toml` (на выделенном сервере; у встроенного сервера —
+  в папке мира `serverconfig`)
+
+Экран настроек: **«Моды» → UnderMine Auth → Config**.
+
+### Клиент
+
+```toml
+apiBaseUrl = "https://staging.undermine.click"
+loginEndpoint = "/api/v1.0/login"
+registerEndpoint = "/api/v1.0/register"
+validateEndpoint = "/api/v1.0/validate-token"
+httpTimeoutSeconds = 15
+requireToken = true
+kickOnExpiredToken = true
+disconnectWhenInvalid = true
+disconnectOnValidationError = false
+notifyOnJoin = true
+sendTokenToServers = true
+```
+
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| `apiBaseUrl` | `https://staging.undermine.click` | Адрес API; переопределяется `UNDERMINE_API_URL` от лаунчера |
+| `loginEndpoint` | `/api/v1.0/login` | Путь входа |
+| `registerEndpoint` | `/api/v1.0/register` | Путь регистрации |
+| `validateEndpoint` | `/api/v1.0/validate-token` | Путь проверки токена |
+| `httpTimeoutSeconds` | `15` | Таймаут запросов к API |
+| `requireToken` | `true` | Кикать без токена **на серверах без мода** |
+| `kickOnExpiredToken` | `true` | Кикать при истёкшем `exp` |
+| `disconnectWhenInvalid` | `true` | Кикать, если API отклонил токен (сервер без мода) |
+| `disconnectOnValidationError` | `false` | Кикать, если проверка недоступна |
+| `notifyOnJoin` | `true` | Писать в чат статус токена при входе |
+| `sendTokenToServers` | `true` | Участвовать в handshake и отправлять токен после `/log`/`/reg` |
+
+### Сервер
+
+```toml
+enabled = true
+allowUnauthenticatedJoin = true
+enforceOnIntegratedServer = false
+allowClientsWithoutMod = false
+validateWithApi = true
+bindTokenToPlayer = true
+apiBaseUrl = "https://staging.undermine.click"
+validateEndpoint = "/api/v1.0/validate-token"
+httpTimeoutSeconds = 10
+validationCacheSeconds = 300
+disconnectOnValidationError = false
+reminderSeconds = 8
+authTimeoutSeconds = 120
+authAttemptCooldownSeconds = 3
+```
+
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| `enabled` | `true` | Включить handshake и limbo |
+| `allowUnauthenticatedJoin` | `true` | Пускать без токена в limbo; `false` — отключать |
+| `enforceOnIntegratedServer` | `false` | Ограничивать также singleplayer/LAN-хост |
+| `allowClientsWithoutMod` | `false` | Пускать клиентов без мода (они не смогут авторизоваться) |
+| `validateWithApi` | `true` | Проверять токены через API |
+| `bindTokenToPlayer` | `true` | Требовать совпадения ника из токена с ником игрока |
+| `apiBaseUrl` | staging | Адрес API для проверки токенов |
+| `validateEndpoint` | `/api/v1.0/validate-token` | Путь проверки |
+| `httpTimeoutSeconds` | `10` | Таймаут проверки |
+| `validationCacheSeconds` | `300` | Кэш принятых токенов; `0` — без кэша |
+| `disconnectOnValidationError` | `false` | Отключать, если API недоступен при входе |
+| `reminderSeconds` | `8` | Период напоминаний |
+| `authTimeoutSeconds` | `120` | Таймер авторизации; `0` — выключен |
+| `authAttemptCooldownSeconds` | `3` | Пауза между попытками `/log` |
+
+> Клиент и сервер должны использовать один и тот же API: клиент получает токен там, где
+> логинится, а сервер проверяет его через свой `apiBaseUrl`.
+
+---
+
+## Интеграция с лаунчером
+
+Лаунчер (репозиторий `undermine-launcher`) уже передаёт в игру:
+
+| Переменная | Назначение |
+|---|---|
+| `UNDERMINE_AUTH_TOKEN` | JWT, полученный при входе в лаунчере |
+| `UNDERMINE_API_URL` | Адрес API из настроек лаунчера |
+| `UNDERMINE_DEVICE_ID` | Хешированный id устройства для регистрации |
+
+Дополнительно токен подставляется в стандартный аргумент `${accessToken}`.
+Токен маскируется (`***`) в логе команды запуска.
+
+Настройка API в лаунчере:
+
+- `appsettings.json` → `Api:BaseUrl`
+- или `.env` → `API__BaseUrl` (например, `https://staging.undermine.click`)
+
+Мод можно использовать и без лаунчера: тогда токен вводится командами `/log`/`/reg` или
+через экран аккаунта; адрес API задаётся в `authmod-client.toml`.
+
+---
+
+## Файлы и данные
+
+| Файл | Где | Что хранит |
+|---|---|---|
+| `authmod-client.toml` | `config/` | Клиентский конфиг |
+| `authmod-server.toml` | `config/` или `saves/<мир>/serverconfig/` | Серверный конфиг |
+| `authmod-session.json` | `config/` | Токен последнего успешного входа (POSIX `600`) |
+| `authmod-accounts.json` | `config/` | Имена аккаунтов для подсказки `/log` vs `/reg` |
+| `authmod-device.json` | `config/` | Стабильный id устройства для регистрации |
+
+Лаунчер дополнительно хранит свою сессию в `%AppData%/UnderMine/`.
+
+---
+
+## Сборка и тесты
+
+```bash
+./gradlew build                         # build/libs/authmod-<version>.jar
+./gradlew test                          # unit-тесты
+./gradlew client -PauthmodToken="<jwt>" # dev-клиент с токеном
+./gradlew client -PquickPlayServer=localhost:25565
+./gradlew runServer
+```
+
+Покрыто тестами:
+
+- декодирование JWT, включая claims в виде полных Microsoft XML-URI
+  (`.../claims/name`, `.../claims/role`);
+- шифрование ECDH + AES-GCM, сессионный ключ, защита от подмены;
+- разбор ответов API (`200`, `401`, `403`, `409`, `429`, `0` — сеть);
+- сборка URL и live-проверка логина/валидации (по желанию):
+
+```bash
+AUTHMOD_LIVE_LOGIN=user AUTHMOD_LIVE_PASSWORD=pass ./gradlew test --tests '*AuthApiLiveTest'
+```
+
+> На Windows с не-ASCII символами в пути Gradle не запускает test-worker (проблема
+> кодировки argfile). Запускайте тесты из ASCII-пути, например через junction:
+>
+> ```powershell
+> cmd /c mklink /J C:\authmod-test "C:\Users\<user>\source\repos\authmod"
+> cd C:\authmod-test
+> gradlew.bat test
+> ```
+
+---
+
+## CI и защита ветки `main`
+
+В репозитории настроены GitHub Actions:
+
+| Проверка | Что делает |
+|---|---|
+| `Build & unit tests` | `gradlew build`: компиляция, unit-тесты и проверка содержимого jar |
+| `Server smoke test` | Поднимает dev-сервер и проверяет, что мод загружается без ошибок |
+| `Gradle wrapper validation` | Проверяет целостность `gradle-wrapper.jar` |
+| `CodeQL analysis` | Статический анализ Java (`security-and-quality`) |
+| `Secret scan` | gitleaks: токены, ключи и пароли в истории коммитов |
+| `Dependency review` | Уязвимые зависимости в pull request |
+
+Как включить обязательные проверки, CODEOWNERS, secret scanning, Dependabot и
+push protection — см. [`.github/BRANCH_PROTECTION.md`](.github/BRANCH_PROTECTION.md).
+
+---
+
+## Безопасность
+
+- **Пароль** передаётся только с клиента в API по HTTPS. Игровой сервер его не получает
+  и не может залогировать.
+- **Токен** до сервера идёт в AES-256-GCM поверх ECDH X25519 с одноразовыми ключами.
+  Пассивный перехват трафика не даёт токен.
+- **Валидация** выполняется сервером через API: подпись, срок, бан, роль, `token_version`.
+  Смена пароля инвалидирует старые токены (кроме окна серверного кэша).
+- **Привязка к игроку**: токен другого аккаунта не подойдёт, даже если его украсть.
+- Внутриигровая сессия хранится в файле; на POSIX выставляются права `600`, на Windows
+  действуют ACL профиля пользователя.
+- Команда `/log` может остаться в локальной истории ввода клиента; если это критично,
+  используйте экран аккаунта.
+- `sendTokenToServers = false` полностью запрещает отправку токена серверам.
+
+### Ограничения
+
+- В offline-mode у Minecraft нет аутентифицированной личности сервера, поэтому активный
+  MITM теоретически возможен (такой сервер мог бы просто попросить пароль). Для критичных
+  случаев используйте TLS-прокси или online-mode.
+- API не раскрывает существование аккаунта, поэтому подсказка `/log`/`/reg` на новом
+  устройстве может сначала предложить `/reg`; `/log` указан рядом.
+- Кэш сервера (`validationCacheSeconds`, по умолчанию 5 минут) задерживает реакцию на
+  отзыв токена через `token_version`.
+- Лимиты API: вход/валидация ограничены по IP; клиентские `/log`/`/reg` идут с IP игрока,
+  а серверная валидация — с IP сервера, поэтому кэш особенно полезен при массовых входах.
+
+---
+
+## Ограничения и устранение неполадок
+
+| Симптом | Причина / решение |
+|---|---|
+| `UnderMine: no authorization token` | Игра запущена не через лаунчер. Войдите через `/log`/`/reg` или экран аккаунта |
+| `did not authenticate within N seconds` | Истёк `authTimeoutSeconds`; увеличьте значение или войдите быстрее |
+| `token belongs to the account X, but the game is logged in as Y` | Ник в игре не совпадает с аккаунтом. Запускайте через лаунчер или задайте тот же ник |
+| `the server rejected your token` | Токен истёк/отозван/забанен — войдите заново |
+| `secure authorization handshake failed` | Перезапустите игру; убедитесь, что версии мода на клиенте и сервере совпадают |
+| `this server requires the UnderMine Auth mod` | Установите мод на клиент (обычно через лаунчер) |
+| Сервер без мода кикает без токена | Клиентский `requireToken = true`; отключите для таких серверов |
+| Singleplayer заморожен/слепой | `enforceOnIntegratedServer = false` (по умолчанию) |
+| API недоступен | Проверьте `apiBaseUrl`/`UNDERMINE_API_URL` и сеть; при желании включите `disconnectOnValidationError` |
+| Клиенты без мода не заходят | `allowClientsWithoutMod = false`; такие клиенты не могут авторизоваться |
+| `/reg`: «пароль не подходит» | Требования API: 8–72 байта; `/reg` не принимает пароли с пробелами |
+
+---
+
+## Устройство проекта
+
+```text
+src/main/java/ru/undermine/authmod/
+├── AuthMod.java                 # общий вход, регистрация конфигов и сети
+├── AuthModClient.java           # клиентские события, кнопка аккаунта, проверки
+├── auth/
+│   ├── AuthConfig.java          # клиентский конфиг
+│   ├── AuthServerConfig.java    # серверный конфиг
+│   ├── ApiEndpoints.java        # адрес/эндпоинты API, UNDERMINE_API_URL
+│   ├── AuthApiClient.java       # /login и /register
+│   ├── HttpJson.java            # асинхронный HTTP-клиент
+│   ├── JwtDecoder.java          # разбор payload JWT (без проверки подписи)
+│   ├── TokenValidator.java      # /validate-token и разбор ответов
+│   ├── TokenInfo.java
+│   ├── AuthGuard.java           # локальные проверки на клиенте
+│   ├── LauncherTokenProvider.java # источники токена
+│   ├── SessionStore.java        # сохранённая сессия
+│   ├── DeviceIdProvider.java    # deviceID для регистрации
+├── net/
+│   ├── AuthCrypto.java          # X25519 + HKDF + AES-GCM
+│   ├── AuthChallengePayload.java
+│   ├── AuthTokenPayload.java
+│   ├── AuthSessionPayload.java  # токен после /log//reg
+│   ├── AuthAccountHintPayload.java
+│   ├── AuthConfigurationTask.java
+│   ├── AuthNetwork.java         # регистрация payload'ов и config task
+│   ├── ClientAuth.java
+│   └── ServerAuth.java          # проверка токена, сессионный ключ, limbo-переходы
+├── server/
+│   ├── AuthState.java           # состояние авторизации, таймеры, якоря
+│   └── AuthEnforcement.java     # слепота, заморозка, защита, напоминания
+└── client/
+    ├── AuthCommands.java        # клиентские /log и /reg
+    ├── PasswordArgument.java
+    ├── AccountHints.java
+    └── gui/AuthScreen.java      # экран аккаунта
+```
+
+Сетевой протокол версионирован (`AuthCrypto.PROTOCOL_VERSION = 2`); при несовпадении
+версий соединение отклоняется с сообщением о сбое рукопожатия.
+
+---
+
+## Проверено
+
+- Регистрация, вход и `validate-token` на `https://staging.undermine.click`.
+- Полный вход через лаунчер-токен и через сохранённую внутриигровую сессию.
+- Limbo без токена: слепота, напоминания, таймер и отключение по истечении.
+- `/reg` на существующем аккаунте → подсказка переключается на `/log`.
+- `/log` с паролем, содержащим `!`, → успешная авторизация, слепота снимается.
+- `gradlew build` и unit-тесты проходят; артефакт: `build/libs/authmod-1.0.0.jar`.

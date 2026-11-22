@@ -56,6 +56,18 @@ neoForge {
             client()
             // Comma-separated list of namespaces to load gametests from. Empty = all namespaces.
             systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+
+            // Development convenience: pass a bearer token to the dev client, e.g.
+            // ./gradlew client -PauthmodToken="<jwt>"
+            if (project.hasProperty('authmodToken')) {
+                systemProperty 'authmod.token', project.property('authmodToken').toString()
+            }
+
+            // Development convenience: auto-join a server, e.g.
+            // ./gradlew client -PquickPlayServer=localhost:25565
+            if (project.hasProperty('quickPlayServer')) {
+                programArguments.addAll '--quickPlayMultiplayer', project.property('quickPlayServer').toString()
+            }
         }
 
         server {
@@ -116,6 +128,12 @@ configurations {
 }
 
 dependencies {
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // Minecraft ships Gson at runtime, but the plain test JVM needs it on the classpath.
+    testImplementation 'com.google.code.gson:gson:2.10.1'
+
     // Example optional mod dependency with JEI
     // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
     // compileOnly "mezz.jei:jei-${mc_version}-common-api:${jei_version}"
@@ -179,6 +197,13 @@ publishing {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8' // Use the UTF-8 charset for Java compilation
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'failed', 'skipped'
+    }
 }
 
 // IDEA no longer automatically downloads sources/javadoc jars for dependencies, so we need to explicitly enable the behavior.

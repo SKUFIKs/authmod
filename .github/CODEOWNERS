@@ -1,0 +1,15 @@
+# Владельцы кода
+#
+# Эти области требуют review владельца: авторизация, сетевой протокол,
+# конфиги безопасности и CI.
+* @SKUFIKs
+
+/.github/ @SKUFIKs
+/build.gradle @SKUFIKs
+/gradle.properties @SKUFIKs
+/settings.gradle @SKUFIKs
+
+/src/main/java/ru/undermine/authmod/auth/ @SKUFIKs
+/src/main/java/ru/undermine/authmod/net/ @SKUFIKs
+/src/main/java/ru/undermine/authmod/server/ @SKUFIKs
+/src/main/resources/assets/authmod/ @SKUFIKs

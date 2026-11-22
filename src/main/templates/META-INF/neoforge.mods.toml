@@ -46,7 +46,14 @@ displayName="${mod_name}" #mandatory
 
 # The description text for the mod (multi line!) (#mandatory)
 description='''
-Example mod description.
+UnderMine authentication for NeoForge 1.21.1.
+
+Reads the bearer token issued by the UnderMine API (from the launcher, environment or the
+in-game login screen), validates it against POST /api/v1.0/validate-token and requires it
+during the configuration phase before a player may join a server. The token is encrypted
+with an ephemeral X25519 + AES-256-GCM handshake, so it is never sent in plain text.
+Players without a valid token join in a restricted limbo mode and authenticate with
+/log or /reg; the client talks to the API directly, so passwords never reach the server.
 '''
 
 # The [[mixins]] block allows you to declare your mixin config to FML so that it gets loaded.
